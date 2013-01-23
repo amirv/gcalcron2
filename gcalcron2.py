@@ -7,7 +7,7 @@
 #    fabriceb@theodo.fr
 #    www.theodo.fr
 
-import gdata.calendar.service
+#import gdata.calendar.service
 import os
 import sys
 import stat
@@ -19,7 +19,25 @@ import time
 import subprocess
 import re
 
+import simplejson as json
+
+
+from apiclient.discovery import build
+#from apiclient.oauth import OAuthCredentials
+
+import httplib2
+#import oauth2 as oauth
+
 DEBUG = os.environ.get('DEBUG')
+
+
+import gflags
+import httplib2
+
+from apiclient.discovery import build
+from oauth2client.file import Storage
+from oauth2client.client import OAuth2WebServerFlow
+from oauth2client.tools import run
 
 
 class GCalAdapter:
@@ -29,42 +47,44 @@ class GCalAdapter:
   """
 
   application_name = 'Theodo-gCalCron-2.0'
-  client = None
+  service = None
   cal_id = None
-  login_token = None
 
 
-  def __init__(self, cal_id=None, login_token=None):
+  def __init__(self, cal_id=None, service=None):
     self.cal_id = cal_id
-    self.login_token = login_token
+    self.service = self.fetch_service()
 
-
-  def get_client(self):
-    """
-    Returns the Google Calendar API client
-    @author Fabrice Bernhard
-    @since 2011-06-13
-    """
-
-    if not self.client:
-      self.client = gdata.calendar.service.CalendarService()
-      if self.login_token:
-        self.client.SetClientLoginToken(self.login_token)
-
-    return self.client
-
-
-  def fetch_login_token(self, email, password):
+  def fetch_service(self):
     """
     Fetches the Google Calendar API token using email and password
     @author Fabrice Bernhard
     @since 2011-06-13
     """
 
-    client = self.get_client()
-    client.ClientLogin(email, password, source=self.application_name)
+    FLAGS = gflags.FLAGS
 
-    return client.GetClientLoginToken()
+    FLOW = OAuth2WebServerFlow(
+        client_id='597481446202-mq48ae25hvplot50ga5ll6rh9q0s9kh1.apps.googleusercontent.com',
+        client_secret='F7-GqngW3KHAMWz2N3WpyuWV',
+        scope='https://www.googleapis.com/auth/calendar.readonly',
+        user_agent='IrrigationDaemon')
+
+# To disable the local server feature, uncomment the following line:
+    FLAGS.auth_local_webserver = False
+
+    storage = Storage(os.path.dirname(sys.argv[0]) + '/calendar.dat')
+    credentials = storage.get()
+    if credentials is None or credentials.invalid == True:
+      credentials = run(FLOW, storage)
+
+    http = httplib2.Http()
+    http = credentials.authorize(http)
+
+    service = build(serviceName='calendar', version='v3', http=http,
+                  developerKey='YOUR_DEVELOPER_KEY')
+
+    return service
 
 
   def get_query(self, start_min, start_max, updated_min=None):
@@ -82,13 +102,15 @@ class GCalAdapter:
 
     if DEBUG: print 'Setting up query: %s to %s modified after %s' % (start_min.isoformat(), start_max.isoformat(), updated_min)
 
-    query = gdata.calendar.service.CalendarEventQuery(self.cal_id, 'private', 'full')
-    query.start_min = start_min.isoformat()
-    query.start_max = start_max.isoformat()
-    query.singleevents = 'true'
-    query.max_results = 1000
+    updatedMin = None
     if updated_min:
-      query.updated_min = updated_min.isoformat()
+        updatedMin = updated_min.isoformat('T')
+
+    query = self.service.events().list(calendarId=self.cal_id,
+            maxResults=1000, showDeleted=True, singleEvents=True,
+            timeMin= start_min.isoformat('T'),
+            timeMax= start_max.isoformat('T'),
+            updatedMin = updatedMin)
 
     return query
 
@@ -113,43 +135,50 @@ class GCalAdapter:
       queries.append(self.get_query(now, end))
 
     # Query the automation calendar.
-    if DEBUG: print 'Submitting query'
+    if DEBUG: print 'Submitting query: '
+
+    e = []
     for query in queries:
-      try:
-        feed = self.get_client().CalendarQuery(query)
-      except gdata.service.RequestError as e:
-        print "Google error:", e.message['reason']
-        print "If you changed your password, run python gcalcron2.py --init "
-        if DEBUG: raise
-        exit()
+        try:
+            events = query.execute()
+        except Exception as e:
+            print "Google error:", e.message
+            print "If you changed your password, run python gcalcron2.py --init "
+            exit()
+        except service.RequestError as e:
+            print "Google error:", e.message['reason']
+            print "If you changed your password, run python gcalcron2.py --init "
+            if DEBUG: raise
+            exit()
 
-      if len(feed.entry) > 0:
-        entries += feed.entry
+        if DEBUG: print 'Query results received'
 
-    if DEBUG: print 'Query results received'
+        for event in events.get('items', []):
+            if DEBUG:
+                print "Event details:"
+                for k in event.keys():
+                    print "\t", k, " : ", event[k]
 
-    events = []
-    for i, event in zip(xrange(len(entries)), entries):
-      start_time = dateutil.parser.parse(event.when[0].start_time).replace(tzinfo=None)
-      end_time   = dateutil.parser.parse(event.when[0].end_time).replace(tzinfo=None)
-      event_id = event.id.text
-      if DEBUG: print event_id, '-', event.event_status.value, '-', event.updated.text, ': ', event.title.text, start_time, ' -> ', end_time, ' (', event.when[0].start_time, ' -> ', event.when[0].end_time, ') ', '=>', event.content.text
-      if event.event_status.value == 'CANCELED':
-        if DEBUG: print "CANCELLED", event_id
-        events.append({
-          'uid': event_id
-        })
-      elif event.content.text:
-        commands = self.parse_commands(event.content.text, start_time, end_time)
-        if commands:
-          events.append({
-              'uid': event_id,
-              'commands': commands
-            })
+            start_time = dateutil.parser.parse(event['start']['dateTime']).replace(tzinfo=None)
+	    end_time   = dateutil.parser.parse(event['end']['dateTime']).replace(tzinfo=None)
+	    event_id = event['id']
+	    if DEBUG:
+	        print event_id, '-', event['status'], '-', event['updated'], ': ', event['summary'], start_time, ' -> ', end_time, ' (', event['start']['dateTime'], ' -> ', event['end']['dateTime'], ') ', '=>', event.get('description', "None")
+	    if event['status'] == 'cancelled':
+	        if DEBUG:
+		    print "CANCELLED", event_id
+		e.append({
+		  'uid': event_id
+		})
+	    elif event['description']:
+	        commands = self.parse_commands(event['description'], start_time, end_time)
+	        if commands:
+		    e.append({
+		        'uid': event_id,
+		        'commands': commands
+		        })
 
-    if DEBUG: print events
-
-    return (events, now)
+    return (e, now)
 
   def parse_commands(self, event_description, start_time, end_time):
     """
@@ -204,7 +233,8 @@ class GCalCron2:
   """
 
   settings = None
-  settings_file = os.getenv('HOME') + '/' + '.gcalcron2'
+  settings_file = "/export/data/projects/GCalCron2" + '/' + '.gcalcron2'
+  #settings_file = os.getenv('HOME') + '/' + '.gcalcron2'
 
 
   def __init__(self, load_settings=True):
@@ -226,11 +256,11 @@ class GCalCron2:
 
   def init_settings(self, email, password, cal_id):
     gcal_adapter = GCalAdapter()
-    login_token = gcal_adapter.fetch_login_token(email, password)
+    service = gcal_adapter.fetch_service()
     self.settings = {
       "jobs": {},
       "google_calendar": {
-        "login_token": login_token,
+        "service": service,
         "cal_id": cal_id
       },
       "last_sync": None
@@ -255,15 +285,14 @@ class GCalCron2:
 
 
   def unschedule_old_jobs(self, events):
-    removed_job_ids = []
-    for event in events:
-      if event['uid'] in self.settings['jobs']:
-        removed_job_ids += self.settings['jobs'][event['uid']]['ids']
-        del self.settings['jobs'][event['uid']]
-    if len(removed_job_ids) > 0:
-      if DEBUG: print ' '.join(['at', '-d'] + removed_job_ids)
-      subprocess.Popen(['at', '-d'] + removed_job_ids)
-
+        removed_job_ids = []
+        for event in events:
+            if event['uid'] in self.settings['jobs']:
+                removed_job_ids += self.settings['jobs'][event['uid']]['ids']
+                del self.settings['jobs'][event['uid']]
+            if len(removed_job_ids) > 0:
+                if DEBUG: print ' '.join(['at', '-d'] + removed_job_ids)
+                subprocess.Popen(['at', '-d'] + removed_job_ids)
 
   def schedule_new_jobs(self, events):
     for event in events:
@@ -310,7 +339,7 @@ class GCalCron2:
     if self.settings['last_sync']:
       last_sync = dateutil.parser.parse(self.settings['last_sync'])
 
-    gcal_adapter = GCalAdapter(self.settings['google_calendar']['cal_id'], self.settings['google_calendar']['login_token'])
+    gcal_adapter = GCalAdapter(self.settings['google_calendar']['cal_id'], self.settings['google_calendar']['service'])
 
     (events, last_sync) = gcal_adapter.get_events(last_sync, num_days)
 
