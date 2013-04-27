@@ -305,7 +305,7 @@ class GCalCron2:
 
         if DEBUG: print "at "+ datetime_to_at(command['exec_time'])
 
-        p = subprocess.Popen(['at', datetime_to_at(command['exec_time'])], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(['at', '-m', datetime_to_at(command['exec_time'])], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         (_, output) = p.communicate(command['command'])
 
         if DEBUG: print "  " + output
